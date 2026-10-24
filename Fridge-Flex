@@ -1,0 +1,131 @@
+from machine import Pin, I2C
+import time
+import struct
+import bluetooth
+import bme280_float
+
+# 5  leds
+
+LED_PINS = [10, 11, 12, 13, 14]
+leds = [Pin(p, Pin.OUT) for p in LED_PINS]
+
+def set_leds(state):
+    for l in leds:
+        l.value(state)
+
+set_leds(1)  # all on when it star
+
+
+# BLUETOOTH CONNECTING/CONNECTION
+
+DEVICE_NAME = "FridgeFlex-Bulb"
+ENV_SENSING = bluetooth.UUID(0x181A)
+TEMP_UUID   = bluetooth.UUID(0x2A6E)
+
+_IRQ_CENTRAL_CONNECT    = 1
+_IRQ_CENTRAL_DISCONNECT = 2
+
+ble = bluetooth.BLE()
+ble.active(True)
+
+TEMP_CHAR    = (TEMP_UUID, bluetooth.FLAG_READ | bluetooth.FLAG_NOTIFY)
+ENV_SERVICE  = (ENV_SENSING, (TEMP_CHAR,))
+((temp_handle,),) = ble.gatts_register_services((ENV_SERVICE,))
+
+def make_adv_payload(name):
+    name_b = name.encode()
+    flags = bytes([2, 0x01, 0x06])
+    namefd = bytes([len(name_b) + 1, 0x09]) + name_b
+    svcs = bytes([3, 0x03]) + struct.pack("<H", 0x181A)
+    return flags + namefd + svcs
+
+ADV_PAYLOAD = make_adv_payload(DEVICE_NAME)
+
+def start_advertising():
+    ble.gap_advertise(500000, adv_data=ADV_PAYLOAD)
+    print("BLE advertising as", DEVICE_NAME)
+
+connections = set()
+
+def ble_irq(event, data):
+    if event == _IRQ_CENTRAL_CONNECT:
+        conn_handle, _, _ = data
+        connections.add(conn_handle)
+        print("BLE: Zero connected")
+    elif event == _IRQ_CENTRAL_DISCONNECT:
+        conn_handle, _, _ = data
+        connections.discard(conn_handle)
+        print("BLE: Zero disconnected")
+        start_advertising()
+
+ble.irq(ble_irq)
+start_advertising()
+
+def send_temp(t_c):
+    value = round(t_c * 100)
+    data = struct.pack("<h", value)
+    ble.gatts_write(temp_handle, data)
+    for conn in connections:
+        ble.gatts_notify(conn, temp_handle)
+    print("BLE sent", value, "to", len(connections), "device(s)")
+
+
+# MAIN LOOP
+
+door = Pin(15, Pin.IN, Pin.PULL_UP)
+
+def door_is_open():
+    return door.value() == 0
+
+STABLE_MS      = 50
+door_state     = None
+door_candidate = None
+door_since     = time.ticks_ms()
+
+i2c = I2C(0, sda=Pin(0), scl=Pin(1), freq=100000)
+
+found = i2c.scan()
+print("I2C devices found: ", [hex(a) for a in found])
+if not found:
+    print("WARNING: no i2c device detected -- check the sensor wiring")
+
+bme = bme280_float.BME280(i2c=i2c, address=found[0]) if found else None
+
+def read_temp_c():
+    t_c = bme.read_compensated_data()[0]
+    if abs(t_c) > 100:
+        t_c = t_c / 100
+    return t_c
+
+TEMP_PERIOD_MS = 1000
+last_temp_ms = time.ticks_ms() - TEMP_PERIOD_MS
+
+print("fridge monitor running. Door = real time, temp = every 1 sec, press stop to end")
+
+while True:
+    now = time.ticks_ms()
+
+    reading = door_is_open()
+    if reading != door_candidate:
+        door_candidate = reading
+        door_since = now
+    elif time.ticks_diff(now, door_since) >= STABLE_MS:
+        if door_candidate != door_state:
+            door_state = door_candidate
+            if door_state:
+                set_leds(1)
+                print("door opened")
+            else:
+                set_leds(0)
+                print("door closed")
+
+    if bme and time.ticks_diff(now, last_temp_ms) >= TEMP_PERIOD_MS:
+        last_temp_ms = now
+        try:
+            t_c = read_temp_c()
+            print("TEMP: {:.1f} F".format(t_c * 9 / 5 + 32))
+            send_temp(t_c)
+        except Exception as e:
+            print("temp read error:", e)
+
+    time.sleep_ms(5)
